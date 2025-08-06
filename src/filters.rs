@@ -1,5 +1,5 @@
 use dptree::{Handler, di::DependencyMap};
-use grammers_client::{Update, types::Message};
+use grammers_client::{Update, types::update::Message};
 
 use crate::{
     GenericResult,
@@ -58,7 +58,7 @@ where
 }
 
 mod private {
-    use grammers_client::{Update, types::Message};
+    use grammers_client::{Update, types::update::Message};
 
     pub trait Sealed {}
 
