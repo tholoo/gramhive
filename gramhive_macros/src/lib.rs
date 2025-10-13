@@ -2,8 +2,8 @@ use deluxe::ExtractAttributes;
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{
-    parse_macro_input, parse_quote, Expr, FnArg, GenericArgument, ItemFn, LitInt, Pat, PatIdent,
-    PathArguments, Type, TypePath,
+    Expr, FnArg, GenericArgument, ItemFn, LitInt, Pat, PatIdent, PathArguments, Type, TypePath,
+    parse_macro_input, parse_quote,
 };
 
 #[derive(ExtractAttributes)]

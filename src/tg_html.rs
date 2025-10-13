@@ -137,10 +137,8 @@ impl TgHtml {
     }
 
     /// Convert this HTML builder into an InputMessage by calling InputMessage::html.
-    ///
-    /// This uses your internal parser (via InputMessage::html) to extract text and entities.
     pub fn into_message(self) -> InputMessage {
-        InputMessage::html(self.as_ref())
+        InputMessage::new().html(self.as_ref())
     }
 }
 
@@ -163,7 +161,7 @@ impl AsRef<str> for TgHtml {
 /// Allow conversion from Html into InputMessage so that functions expecting Into<InputMessage> work seamlessly.
 impl From<TgHtml> for InputMessage {
     fn from(html: TgHtml) -> Self {
-        InputMessage::html(html.as_ref())
+        InputMessage::new().html(html.as_ref())
     }
 }
 
