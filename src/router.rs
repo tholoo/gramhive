@@ -1,4 +1,4 @@
-use std::ops::ControlFlow;
+use std::{ops::ControlFlow, sync::Arc};
 
 use dptree::{Handler, di::DependencyMap};
 
@@ -67,8 +67,8 @@ impl Router {
             let task = tokio::spawn(async move {
                 let dispatched = handler.dispatch(deps_clone.clone()).await;
                 if let ControlFlow::Break(Err(err)) = dispatched {
-                    deps_clone.insert(err);
-                    error_handler.dispatch(deps_clone).await;
+                    deps_clone.insert(Arc::new(err));
+                    let _ = error_handler.dispatch(deps_clone).await;
                 }
             });
 
