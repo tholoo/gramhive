@@ -2,13 +2,17 @@ use std::sync::Arc;
 
 use dptree::di::DependencyMap;
 use grammers_client::{Client, InvocationError, types::User};
-use tokio::sync;
+use tokio::{
+    sync::{Mutex, broadcast},
+    task::JoinHandle,
+};
 use tracing::{error, info};
 
 use crate::router::Router;
 
 pub struct Swarm {
-    objects: Vec<SwarmObject>,
+    shutdown_tx: broadcast::Sender<()>,
+    tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
 pub struct SwarmObject {
@@ -35,74 +39,63 @@ impl SwarmObject {
 }
 
 impl Swarm {
-    pub fn new() -> Self {
-        Self {
-            objects: Vec::new(),
-        }
+    pub fn new() -> Arc<Self> {
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+        Arc::new(Self {
+            shutdown_tx,
+            tasks: Mutex::new(Vec::new()),
+        })
     }
 
-    pub fn add(&mut self, object: SwarmObject) -> &mut Self {
-        self.objects.push(object);
-        self
-    }
+    pub async fn add(self: &Arc<Self>, object: SwarmObject) {
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        let client = object.client.clone();
 
-    pub async fn run(&self) -> anyhow::Result<()> {
-        let (shutdown_tx, _) = sync::broadcast::channel::<()>(1);
+        let router = if let Some(username) = object.me.username() {
+            let mut r = (*object.router).clone();
+            r.reinit_command_regexes(username);
+            Arc::new(r)
+        } else {
+            object.router.clone()
+        };
 
-        for object in &self.objects {
-            let mut shutdown_rx = shutdown_tx.subscribe();
-            let client = object.client.clone();
+        let mut deps = object.deps.clone();
+        let _ = deps.insert(client.clone());
 
-            let router = if let Some(username) = object.me.username() {
-                let mut router: Router = match Arc::try_unwrap(object.router.clone()) {
-                    Ok(r) => r,
-                    Err(shared_arc) => (*shared_arc).clone(),
-                };
-                router.reinit_command_regexes(username);
-                Arc::new(router)
-            } else {
-                object.router.clone()
-            };
-
-            let mut deps = object.deps.clone();
-            let _ = deps.insert(client.clone());
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        biased;
-
-                        _ = shutdown_rx.recv() => {
-                            info!("Shutting down client task...");
-                            break
-                        },
-
-                        result = client.next_update() => {
-                            match result {
-                                Ok(update) => {
-                                    let _ = deps.insert(update);
-                                    let deps = deps.clone();
-                                    let router = router.clone();
-                                    tokio::spawn(async move {
-                                        router.dispatch(deps).await;
-                                    });
-                                }
-                                Err(err) => error!("Client error: {}", err),
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.recv() => {
+                        info!("Shutting down client task…");
+                        break;
+                    }
+                    result = client.next_update() => {
+                        match result {
+                            Ok(update) => {
+                                let _ = deps.insert(update);
+                                let deps = deps.clone();
+                                let router = router.clone();
+                                tokio::spawn(async move {
+                                    router.dispatch(deps).await;
+                                });
                             }
+                            Err(err) => error!("Client error: {err}"),
                         }
                     }
                 }
-            });
-        }
+            }
+        });
 
-        tokio::signal::ctrl_c().await?;
-        shutdown_tx.send(())?;
-
-        Ok(())
+        self.tasks.lock().await.push(handle);
     }
-}
 
-impl Default for Swarm {
-    fn default() -> Self {
-        Self::new()
+    pub async fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(());
+        let mut tasks = self.tasks.lock().await;
+        for h in tasks.drain(..) {
+            if let Err(e) = h.await {
+                error!("Task join error: {e}");
+            }
+        }
     }
 }
