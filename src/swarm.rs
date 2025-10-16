@@ -1,16 +1,26 @@
 use dptree::di::DependencyMap;
 use grammers_client::{
-    Client, InvocationError,
+    ChatMap, Client, InvocationError, Update,
+    grammers_tl_types::enums,
+    session::State,
     types::{User, update::Message},
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{
     sync::{Mutex, broadcast, oneshot},
     task::JoinHandle,
+    time::timeout,
 };
 use tracing::{error, info};
 
 use crate::router::Router;
+
+#[derive(Clone)]
+pub struct RawUpdateData {
+    pub update: enums::Update,
+    pub state: State,
+    pub chat_map: Arc<ChatMap>,
+}
 
 pub struct Swarm {
     shutdown_tx: broadcast::Sender<()>,    // global shutdown
@@ -26,6 +36,7 @@ struct TaskEntry {
 pub struct SwarmObject {
     pub client: Arc<Client>,
     pub router: Arc<Router>,
+    pub raw_router: Arc<Router>,
     pub deps: DependencyMap,
     me: User,
 }
@@ -35,6 +46,7 @@ impl SwarmObject {
         client: Arc<Client>,
         me: Option<User>,
         router: Arc<Router>,
+        raw_router: Arc<Router>,
         deps: DependencyMap,
     ) -> Result<Self, InvocationError> {
         let me = match me {
@@ -44,6 +56,7 @@ impl SwarmObject {
         Ok(Self {
             client,
             router,
+            raw_router,
             deps,
             me,
         })
@@ -73,7 +86,6 @@ impl Swarm {
     pub async fn wait_for_reply(&self, client_id: i64, chat_id: i64) -> Result<Message, WaitError> {
         let (tx, rx) = oneshot::channel::<Message>();
 
-        // Ensure only one waiter per (client, chat)
         let mut waiters = self.waiters.lock().await;
         if waiters.contains_key(&(client_id, chat_id)) {
             return Err(WaitError::AlreadyWaiting(client_id, chat_id));
@@ -81,7 +93,15 @@ impl Swarm {
         waiters.insert((client_id, chat_id), tx);
         drop(waiters);
 
-        rx.await.map_err(|_| WaitError::Cancelled)
+        match timeout(Duration::from_secs(60), rx).await {
+            Ok(Ok(msg)) => Ok(msg),
+            Ok(Err(_)) => Err(WaitError::Cancelled),
+            Err(_) => {
+                // remove stale waiter on timeout
+                self.waiters.lock().await.remove(&(client_id, chat_id));
+                Err(WaitError::Cancelled)
+            }
+        }
     }
 
     pub async fn add(self: &Arc<Self>, object: SwarmObject) {
@@ -93,6 +113,7 @@ impl Swarm {
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let client = object.client.clone();
+        let swarm = Arc::clone(self);
 
         let router = if let Some(username) = object.me.username() {
             let mut r = (*object.router).clone();
@@ -101,22 +122,20 @@ impl Swarm {
         } else {
             object.router.clone()
         };
+        let raw_router = object.raw_router.clone();
 
         let mut deps = object.deps.clone();
         let _ = deps.insert(client.clone());
 
-        // per-task oneshot
         let (task_shutdown_tx, mut task_shutdown_rx) = oneshot::channel::<()>();
 
         let handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    // global shutdown (broadcast)
                     _ = shutdown_rx.recv() => {
                         info!("Shutting down client task (global)…");
                         break;
                     }
-                    // targeted shutdown (oneshot)
                     _ = &mut task_shutdown_rx => {
                         info!("Shutting down client task (targeted)…");
                         break;
@@ -124,11 +143,40 @@ impl Swarm {
                     result = client.next_update() => {
                         match result {
                             Ok(update) => {
+                                if let Update::NewMessage(message) = &update {
+                                    let chat_id = message.chat().id();
+                                    let key = (id, chat_id);
+
+                                    if let Some(tx) = swarm.waiters.lock().await.remove(&key) {
+                                        // Deliver to waiter; do not route
+                                        let _ = tx.send(message.clone());
+                                        continue; // <-- skip router
+                                    }
+                                }
+
                                 let _ = deps.insert(update);
                                 let deps = deps.clone();
                                 let router = router.clone();
                                 tokio::spawn(async move {
                                     router.dispatch(deps).await;
+                                });
+                            }
+                            Err(err) => error!("Client error: {err}"),
+                        }
+                    }
+                    raw_result = client.next_raw_update() => {
+                        match raw_result {
+                            Ok(raw_update) => {
+                                let data = RawUpdateData {
+                                    update: raw_update.0,
+                                    state: raw_update.1,
+                                    chat_map: raw_update.2,
+                                };
+                                let _ = deps.insert(data);
+                                let deps = deps.clone();
+                                let raw_router = raw_router.clone();
+                                tokio::spawn(async move {
+                                    raw_router.dispatch(deps).await;
                                 });
                             }
                             Err(err) => error!("Client error: {err}"),

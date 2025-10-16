@@ -129,7 +129,7 @@ define_update_ext! {
     (filter_callback_query, Update::CallbackQuery),
     (filter_inline_query, Update::InlineQuery),
     (filter_inline_send, Update::InlineSend),
-    (filter_inline_raw, Update::Raw),
+    (filter_raw, Update::Raw),
 }
 
 macro_rules! define_message_ext {
