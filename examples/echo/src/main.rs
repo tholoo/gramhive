@@ -13,24 +13,30 @@ struct AppState {
 #[derive(Command)]
 #[command(name = "start", description = "Show the welcome message")]
 struct Start;
+
 #[derive(Command)]
 #[command(name = "echo", description = "Echo text")]
 struct Echo {
     #[rest]
     text: String,
 }
+
 #[derive(Command)]
 #[command(name = "stats")]
 struct Stats;
+
 #[derive(Command)]
 #[command(name = "progress")]
 struct Editing;
+
 #[derive(Command)]
 #[command(name = "temporary")]
 struct Temporary;
+
 #[derive(Command)]
 #[command(name = "manual")]
 struct Manual;
+
 #[derive(Command)]
 #[command(name = "raw")]
 struct Advanced;
@@ -45,6 +51,7 @@ enum EchoAction {
 async fn echo(Text(text): Text) -> Reply {
     Reply::text(text)
 }
+
 async fn echo_command(
     Command(Echo { text }): Command<Echo>,
     State(state): State<AppState>,
@@ -52,6 +59,7 @@ async fn echo_command(
     state.echoes.fetch_add(1, Ordering::Relaxed);
     Reply::text(text)
 }
+
 async fn start(Account(account): Account) -> Result<Reply, Failure> {
     let buttons = vec![vec![
         Button::callback(
@@ -75,6 +83,7 @@ async fn start(Account(account): Account) -> Result<Reply, Failure> {
     ))
     .buttons(buttons))
 }
+
 async fn action(Callback(cb): Callback, Data(action): Data<EchoAction>) -> impl IntoResponse {
     let text = match action {
         EchoAction::Uppercase { text } => text.to_uppercase(),
@@ -82,12 +91,14 @@ async fn action(Callback(cb): Callback, Data(action): Data<EchoAction>) -> impl 
     };
     cb.answer().edit(text)
 }
+
 async fn stats(State(state): State<AppState>) -> Reply {
     Reply::text(format!(
         "{} /echo requests",
         state.echoes.load(Ordering::Relaxed)
     ))
 }
+
 fn stages() -> impl gramhive::Stream<Item = ProgressItem> {
     stream! {
         yield ProgressItem::update("Starting…");
@@ -97,12 +108,15 @@ fn stages() -> impl gramhive::Stream<Item = ProgressItem> {
         yield ProgressItem::finish(Reply::text("Done"));
     }
 }
+
 async fn editing() -> Progress {
     Progress::editing(stages())
 }
+
 async fn temporary() -> Progress {
     Progress::temporary(stages())
 }
+
 async fn manual(Tg(tg): Tg) -> Result<(), Failure> {
     let status = tg.send("Starting…").await?;
     status.edit("Finishing…").await?;
@@ -110,6 +124,7 @@ async fn manual(Tg(tg): Tg) -> Result<(), Failure> {
     tg.send("Done").await?;
     Ok(())
 }
+
 async fn advanced(Raw(client): Raw<grammers::Client>) -> Result<Reply, Failure> {
     let me = client.get_me().await.map_err(|e| Failure(e.to_string()))?;
     Ok(Reply::text(format!(
@@ -117,6 +132,7 @@ async fn advanced(Raw(client): Raw<grammers::Client>) -> Result<Reply, Failure> 
         me.id().bare_id_unchecked()
     )))
 }
+
 fn app() -> Router<AppState> {
     Router::with_state(AppState::default())
         .route(command::<Start>(), start)
@@ -131,6 +147,7 @@ fn app() -> Router<AppState> {
         .layer(ConcurrencyLimit::new(16))
         .layer(Trace)
 }
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt()
@@ -150,9 +167,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 mod tests {
     use super::*;
     use gramhive_test::TestApp;
+
     #[tokio::test]
     async fn example_works_without_telegram() {
         let app = TestApp::new(app());
+
         app.message("hello").send().await.assert_reply("hello");
         app.message("/echo hello from rust")
             .send()
@@ -162,6 +181,7 @@ mod tests {
             .send()
             .await
             .assert_reply("1 /echo requests");
+
         let result = app
             .callback(EchoAction::Uppercase {
                 text: "hello".into(),
@@ -170,6 +190,7 @@ mod tests {
             .await;
         result.assert_callback_answered();
         result.assert_edit("HELLO");
+
         app.message("/progress").send().await.assert_edit("Done");
         app.message("/temporary").send().await.assert_reply("Done");
         app.message("/manual").send().await.assert_handled();
