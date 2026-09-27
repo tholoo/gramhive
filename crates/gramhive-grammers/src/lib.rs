@@ -4,4 +4,4 @@ mod driver;
 mod runtime;
 pub use driver::{TelegramDriver, translate};
 pub use grammers_client as grammers;
-pub use runtime::{BotAccount, Hive, UserAccount};
+pub use runtime::{BotAccount, Hive, ShutdownPolicy, UserAccount};

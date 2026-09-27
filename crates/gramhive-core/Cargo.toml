@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 futures.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["time", "macros"] }
 thiserror.workspace = true
 tracing.workspace = true
 tower-service = "0.3"

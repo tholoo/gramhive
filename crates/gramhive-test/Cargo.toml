@@ -10,6 +10,6 @@ gramhive-core.workspace = true
 futures.workspace = true
 [dev-dependencies]
 gramhive.workspace = true
-tokio = { workspace = true, features = ["rt", "macros", "time"] }
+tokio = { workspace = true, features = ["rt", "macros", "time", "test-util"] }
 async-stream = "0.3"
 trybuild = "1"

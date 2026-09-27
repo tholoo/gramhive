@@ -8,9 +8,12 @@ license.workspace = true
 [dependencies]
 gramhive-core.workspace = true
 futures.workspace = true
-tokio = { workspace = true, features = ["rt", "macros", "signal"] }
+tokio = { workspace = true, features = ["rt", "macros", "signal", "time"] }
 tracing.workspace = true
 grammers-client = { version = "=0.10.0", default-features = false, features = ["fs"] }
 grammers-session = "=0.10.0"
 # grammers-crypto 0.10 expects rc0's BigUint and bool API; rc1 breaks both.
 glass_pumpkin = "=2.0.0-rc0"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

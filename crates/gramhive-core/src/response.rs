@@ -1,6 +1,6 @@
-use crate::{BoxFuture, CallbackData, CallbackDataError, Stream, codec};
-use futures::{StreamExt, future::join_all};
-use std::{path::PathBuf, pin::Pin, sync::Arc};
+use crate::{BoxFuture, CallbackData, CallbackDataError, Progress, codec};
+use futures::future::join_all;
+use std::{path::PathBuf, sync::Arc};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
@@ -87,6 +87,9 @@ pub trait Driver: Send + Sync {
     fn execute(&self, operation: Operation) -> BoxFuture<'_, Result<Option<i32>, Failure>>;
     /// Semantic observation hook used by test drivers; not a Telegram operation.
     fn progress(&self, _event: ProgressEvent) {}
+    /// Executor bookkeeping for cancellation; transports normally leave these as no-ops.
+    fn track_temporary(&self, _message: i32) {}
+    fn forget_temporary(&self, _message: i32) {}
 }
 #[derive(Clone)]
 pub struct Telegram {
@@ -261,72 +264,6 @@ impl IntoResponse for AnswerCallback {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProgressStrategy {
-    Editing,
-    Temporary,
-}
-pub enum ProgressItem {
-    Update(String),
-    Finish(Reply),
-}
-impl ProgressItem {
-    pub fn update(text: impl Into<String>) -> Self {
-        Self::Update(text.into())
-    }
-    pub fn finish(body: impl Into<Reply>) -> Self {
-        Self::Finish(body.into())
-    }
-}
-pub trait IntoProgressItem {
-    fn into_progress_item(self) -> Result<ProgressItem, Failure>;
-}
-impl IntoProgressItem for ProgressItem {
-    fn into_progress_item(self) -> Result<ProgressItem, Failure> {
-        Ok(self)
-    }
-}
-impl IntoProgressItem for Result<ProgressItem, Failure> {
-    fn into_progress_item(self) -> Result<ProgressItem, Failure> {
-        self
-    }
-}
-pub struct Progress {
-    strategy: ProgressStrategy,
-    stream: Pin<Box<dyn Stream<Item = Result<ProgressItem, Failure>> + Send>>,
-}
-impl Progress {
-    pub fn editing<S>(stream: S) -> Self
-    where
-        S: Stream + Send + 'static,
-        S::Item: IntoProgressItem,
-    {
-        Self::new(ProgressStrategy::Editing, stream)
-    }
-    pub fn temporary<S>(stream: S) -> Self
-    where
-        S: Stream + Send + 'static,
-        S::Item: IntoProgressItem,
-    {
-        Self::new(ProgressStrategy::Temporary, stream)
-    }
-    fn new<S>(strategy: ProgressStrategy, stream: S) -> Self
-    where
-        S: Stream + Send + 'static,
-        S::Item: IntoProgressItem,
-    {
-        Self {
-            strategy,
-            stream: Box::pin(stream.map(IntoProgressItem::into_progress_item)),
-        }
-    }
-}
-impl IntoResponse for Progress {
-    fn into_response(self) -> Response {
-        Response::Progress(self)
-    }
-}
-
 /// Shared by production and test drivers. Parallel waits for all children, even on failure.
 /// Sequence stops at the first failure. Neither composition offers rollback.
 pub fn execute(
@@ -349,81 +286,7 @@ pub fn execute(
                 }
                 Ok(())
             }
-            Response::Progress(mut progress) => {
-                let mut message = None;
-                let result = async {
-                    while let Some(item) = progress.stream.next().await {
-                        match item? {
-                            ProgressItem::Update(text) => {
-                                driver.progress(ProgressEvent::Update(text.clone()));
-                                let body = Reply::text(text);
-                                if let Some(id) = message {
-                                    driver
-                                        .execute(Operation::Edit {
-                                            message: Some(id),
-                                            body,
-                                        })
-                                        .await?;
-                                } else {
-                                    message = Some(
-                                        driver
-                                            .execute(Operation::Send { body, reply: true })
-                                            .await?
-                                            .ok_or_else(|| {
-                                                Failure(
-                                                    "driver did not return a progress message ID"
-                                                        .into(),
-                                                )
-                                            })?,
-                                    );
-                                }
-                            }
-                            ProgressItem::Finish(body) => {
-                                driver.progress(ProgressEvent::Finished(body.clone()));
-                                match (progress.strategy, message) {
-                                    (ProgressStrategy::Editing, Some(id)) => {
-                                        driver
-                                            .execute(Operation::Edit {
-                                                message: Some(id),
-                                                body,
-                                            })
-                                            .await?;
-                                    }
-                                    (ProgressStrategy::Temporary, Some(id)) => {
-                                        driver
-                                            .execute(Operation::Delete { message: Some(id) })
-                                            .await?;
-                                        message = None;
-                                        driver
-                                            .execute(Operation::Send { body, reply: true })
-                                            .await?;
-                                    }
-                                    (_, None) => {
-                                        driver
-                                            .execute(Operation::Send { body, reply: true })
-                                            .await?;
-                                    }
-                                }
-                                return Ok(()); // Finish is terminal; the producer is dropped.
-                            }
-                        }
-                    }
-                    Err(Failure(
-                        "progress stream ended without a final result".into(),
-                    ))
-                }
-                .await;
-                if result.is_err()
-                    && progress.strategy == ProgressStrategy::Temporary
-                    && let Some(id) = message
-                    && let Err(error) = driver
-                        .execute(Operation::Delete { message: Some(id) })
-                        .await
-                {
-                    tracing::warn!(%error, "temporary progress cleanup failed");
-                }
-                result
-            }
+            Response::Progress(progress) => progress.execute(driver).await,
         }
     })
 }

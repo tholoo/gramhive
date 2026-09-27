@@ -180,7 +180,7 @@ async fn typed_callback_is_answered_and_edited() {
     app.callback_bytes(b"different".to_vec())
         .send()
         .await
-        .assert_not_matched();
+        .assert_notice("This button has expired. Please request a new one.");
 }
 #[tokio::test]
 async fn missing_extraction_skips_but_invalid_extraction_rejects() {

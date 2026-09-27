@@ -2,7 +2,7 @@ use crate::translate;
 use gramhive_core::{AccountInfo, Dispatch, Failure, Router};
 use grammers_client::{Client, SenderPool, client::UpdatesConfiguration};
 use grammers_session::storages::SqliteSession;
-use std::{collections::HashSet, future::Future, path::PathBuf, sync::Arc};
+use std::{collections::HashSet, future::Future, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{sync::watch, task::JoinSet};
 
 pub struct BotAccount {
@@ -40,11 +40,28 @@ struct Registration {
     name: String,
     credentials: Credentials,
 }
+/// Shutdown waits for normal completion, then cancels with bounded cleanup.
+#[derive(Clone, Copy, Debug)]
+pub struct ShutdownPolicy {
+    pub grace_period: Duration,
+    pub cleanup_timeout: Duration,
+}
+
+impl Default for ShutdownPolicy {
+    fn default() -> Self {
+        Self {
+            grace_period: Duration::from_secs(30),
+            cleanup_timeout: Duration::from_secs(5),
+        }
+    }
+}
+
 pub struct Hive {
     api_id: i32,
     api_hash: String,
     accounts: Vec<Registration>,
     max_in_flight: usize,
+    shutdown: ShutdownPolicy,
 }
 impl Hive {
     pub fn new(api_id: i32, api_hash: impl Into<String>) -> Self {
@@ -53,6 +70,7 @@ impl Hive {
             api_hash: api_hash.into(),
             accounts: Vec::new(),
             max_in_flight: 64,
+            shutdown: ShutdownPolicy::default(),
         }
     }
     pub fn bot(mut self, name: impl Into<String>, account: BotAccount) -> Self {
@@ -74,6 +92,11 @@ impl Hive {
         self.max_in_flight = max;
         self
     }
+    pub fn shutdown_policy(mut self, policy: ShutdownPolicy) -> Self {
+        self.shutdown = policy;
+        self
+    }
+
     pub async fn serve<S: Send + Sync + 'static>(self, app: Router<S>) -> Result<(), Failure> {
         self.serve_until(app, async {
             if let Err(error) = tokio::signal::ctrl_c().await {
@@ -82,7 +105,8 @@ impl Hive {
         })
         .await
     }
-    /// Stops intake, drains handlers, synchronizes update state, then closes each sender pool.
+    /// Stops intake, applies the shutdown grace/cleanup budgets, saves update state,
+    /// then closes each sender pool.
     pub async fn serve_until<S, F>(self, app: Router<S>, shutdown: F) -> Result<(), Failure>
     where
         S: Send + Sync + 'static,
@@ -97,6 +121,7 @@ impl Hive {
                 self.api_id,
                 self.api_hash.clone(),
                 self.max_in_flight,
+                self.shutdown,
                 app.clone(),
                 rx.clone(),
             ));
@@ -189,6 +214,7 @@ async fn run_account<S: Send + Sync + 'static>(
     api_id: i32,
     api_hash: String,
     max: usize,
+    shutdown: ShutdownPolicy,
     app: Router<S>,
     mut stop: watch::Receiver<bool>,
 ) -> Result<(), Failure> {
@@ -265,6 +291,7 @@ async fn run_account<S: Send + Sync + 'static>(
         result = initialize => result?,
     };
     let mut handlers = JoinSet::new();
+    let (cancel, cancelled) = watch::channel(false);
     let outcome = loop {
         tokio::select! {
             _ = stopped(&mut stop) => break Ok(()),
@@ -274,28 +301,71 @@ async fn run_account<S: Send + Sync + 'static>(
                     Err(error) => break Err(Failure(error.to_string())),
                     Ok(update) => if let Some(event) = translate(account.clone(), client.clone(), update) {
                         let app = app.clone();
-                        handlers.spawn(async move { app.handle(event).await });
+                        let mut cancelled = cancelled.clone();
+                        handlers.spawn(async move {
+                            app.handle_until(event, stopped(&mut cancelled), shutdown.cleanup_timeout).await
+                        });
                     }
                 }
             }
         }
     };
+    finish_handlers(&mut handlers, cancel, shutdown).await;
+    let sync = tokio::time::timeout(shutdown.cleanup_timeout, updates.sync_update_state())
+        .await
+        .map_err(|_| Failure("saving update state timed out".into()))
+        .and_then(|result| result.map_err(|e| Failure(e.to_string())));
+    pool.handle.quit();
+    if tokio::time::timeout(shutdown.cleanup_timeout, &mut pool.task)
+        .await
+        .is_err()
+    {
+        tracing::warn!("sender pool shutdown timed out");
+    }
+    outcome.and(sync)
+}
+type HandlerTasks = JoinSet<Result<Dispatch, Failure>>;
+
+async fn drain_handlers(handlers: &mut HandlerTasks) {
     while let Some(result) = handlers.join_next().await {
         report_handler(Some(result));
     }
-    let sync = updates
-        .sync_update_state()
-        .await
-        .map_err(|e| Failure(e.to_string()));
-    pool.handle.quit();
-    let _ = (&mut pool.task).await;
-    outcome.and(sync)
 }
+
+async fn finish_handlers(
+    handlers: &mut HandlerTasks,
+    cancel: watch::Sender<bool>,
+    policy: ShutdownPolicy,
+) {
+    if tokio::time::timeout(policy.grace_period, drain_handlers(handlers))
+        .await
+        .is_ok()
+    {
+        return;
+    }
+    tracing::info!(
+        remaining = handlers.len(),
+        "shutdown grace period elapsed; cancelling handlers"
+    );
+    let _ = cancel.send(true);
+    if tokio::time::timeout(policy.cleanup_timeout, drain_handlers(handlers))
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            remaining = handlers.len(),
+            "shutdown cleanup timed out; aborting handlers"
+        );
+        handlers.abort_all();
+        drain_handlers(handlers).await;
+    }
+}
+
 fn report_handler(result: Option<Result<Result<Dispatch, Failure>, tokio::task::JoinError>>) {
     match result {
-        Some(Ok(Err(error))) => tracing::error!(%error, "handler or response failed"),
+        Some(Ok(Ok(Dispatch::Cancelled))) => tracing::debug!("handler cancelled"),
+        Some(Err(error)) if error.is_cancelled() => tracing::debug!("handler aborted"),
         Some(Err(error)) => tracing::error!(%error, "handler task panicked"),
-        Some(Ok(Ok(Dispatch::Rejected(error)))) => tracing::warn!(%error, "event rejected"),
         _ => {}
     }
 }
@@ -303,6 +373,67 @@ fn report_handler(result: Option<Result<Result<Dispatch, Failure>, tokio::task::
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_allows_handlers_to_finish_within_the_grace_period() {
+        let (cancel, cancelled) = watch::channel(false);
+        let mut handlers = JoinSet::new();
+        handlers.spawn(async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Ok(Dispatch::Handled)
+        });
+        let start = tokio::time::Instant::now();
+        finish_handlers(&mut handlers, cancel, ShutdownPolicy::default()).await;
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+        assert!(!*cancelled.borrow());
+        assert!(handlers.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_signals_cancellation_only_after_grace_then_allows_cleanup() {
+        let (cancel, mut cancelled) = watch::channel(false);
+        let mut handlers = JoinSet::new();
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = finished.clone();
+        handlers.spawn(async move {
+            stopped(&mut cancelled).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(Dispatch::Cancelled)
+        });
+        let start = tokio::time::Instant::now();
+        finish_handlers(
+            &mut handlers,
+            cancel,
+            ShutdownPolicy {
+                grace_period: Duration::from_secs(3),
+                cleanup_timeout: Duration::from_secs(2),
+            },
+        )
+        .await;
+        assert_eq!(start.elapsed(), Duration::from_secs(4));
+        assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(handlers.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_aborts_a_handler_that_does_not_finish_during_cleanup() {
+        let (cancel, _cancelled) = watch::channel(false);
+        let mut handlers = JoinSet::new();
+        handlers.spawn(futures::future::pending::<Result<Dispatch, Failure>>());
+        let start = tokio::time::Instant::now();
+        finish_handlers(
+            &mut handlers,
+            cancel,
+            ShutdownPolicy {
+                grace_period: Duration::from_secs(3),
+                cleanup_timeout: Duration::from_secs(2),
+            },
+        )
+        .await;
+        assert_eq!(start.elapsed(), Duration::from_secs(5));
+        assert!(handlers.is_empty());
+    }
+
     #[test]
     fn rejects_invalid_registration_before_connecting() {
         assert!(Hive::new(1, "hash").validate().is_err());

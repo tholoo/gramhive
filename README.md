@@ -27,7 +27,8 @@ Obtain the API ID/hash through [Telegram's API development tools](https://my.tel
 and a bot token from BotFather. Credentials are read at runtime, never compiled in.
 The example creates `echo.session` using grammers' SQLite session storage.
 Session files contain authorization credentials; keep them private.
-Ctrl+C stops intake, drains handlers, saves update state, and closes connections.
+Ctrl+C stops intake, allows 30 seconds for handlers to finish, then cancels unfinished
+work with bounded cleanup before saving update state and closing connections.
 
 [The complete example](examples/echo/src/main.rs) demonstrates `/start`, `/echo`,
 `/stats`, `/progress`, `/temporary`, `/manual`, `/raw`, and typed inline buttons.
@@ -56,11 +57,21 @@ so the final text route can deliberately echo them.
 | `Dispatch::NotMatched` | No route accepted the event |
 | `Rejection::Missing` | Required data absent; try the next route |
 | `Dispatch::Rejected(Rejection::Invalid(..))` | Invalid command/callback input; stop routing |
-| `Dispatch::Handled` | Handler and response execution completed |
+| `Dispatch::Handled` | Handler/response or expired-button fallback completed |
+| `Dispatch::Cancelled` | Work was cancelled; temporary progress cleanup was attempted |
 | `Err(Failure)` | Handler explicitly failed or response/transport execution failed |
 
-The runtime logs rejections and failures; it does not automatically send error
-messages. Custom middleware can implement an application-specific rejection policy.
+The default `ResponsePolicy` sends helpful validation messages, a generic
+“Something went wrong. Please try again.” for internal failures, and callback
+answers for invalid or expired buttons. Internal error details are logged, never
+included in the default failure message. `Rejection::Invalid` is explicitly public
+validation text; do not put internal error details in it.
+
+Use `.response_policy(MyPolicy)` to implement application-specific wording or
+localization, or `.response_policy(SilentPolicy)` to disable automatic notices.
+Presentation runs after middleware, preserving the original rejection/failure
+outcome for callers and tests. Failed notices are logged once without retry loops.
+Applications that return an error as a normal `Reply` retain full control.
 A `command::<T>()` route validates arguments even if its handler does not extract
 `Command<T>`. A typed extractor parses them again, keeping routing and extraction
 independent and avoiding hidden dependency storage. Custom parsers should be pure.
@@ -151,7 +162,22 @@ prefix, variant name, and each field in declaration order. Reordering variants a
 adding variants preserve existing payloads. Renaming variants or changing field
 order/types breaks them; change the prefix when changing a schema. Invalid UTF-8,
 truncation, unknown variants/versions, extra bytes, and payloads outside 1–64 bytes
-produce errors. Unicode is measured in **bytes**. Keep large data server-side and
+produce errors. Unmatched callbacks receive “This button has expired. Please
+request a new one.” after all routes have been tried. During a schema transition,
+register the old handler alongside the new handler with an absolute deadline:
+
+```rust
+Router::new()
+    .route(callback::<OldAction>().until(migration_deadline), old_action)
+    .route(callback::<NewAction>(), new_action)
+```
+
+`migration_deadline` is a configured `std::time::SystemTime`; keep it fixed across
+restarts. After the deadline the old matcher stops accepting input, and the expired
+fallback answers old buttons. Remove the old route in a later deployment. This does
+not migrate payloads automatically, and existing valid routes never expire implicitly.
+
+Unicode is measured in **bytes**. Keep large data server-side and
 encode a short identifier. `Button::callback` is fallible and checks even manually
 implemented codecs before a button can be sent.
 
@@ -182,8 +208,9 @@ ordinary chat target. The raw API remains available for advanced inline operatio
 without a reply link. `File::new(path)` uploads a local document.
 
 Application errors can implement `IntoResponse` to send useful messages.
-Returning `Failure` instead propagates a failure to the caller/runtime. No blanket
-conversion silently turns arbitrary errors into user-visible text.
+Returning `Failure` preserves the failure for the caller and triggers the generic
+notice from the response policy. No blanket conversion turns arbitrary errors into
+user-visible technical details.
 
 Arbitrary composition is explicit:
 
@@ -224,9 +251,24 @@ Finish without any updates sends the result directly. Finish is terminal and dro
 the producer; a stream that ends without finishing is an error. Streams may yield
 `Result<ProgressItem, Failure>` (for example with `async_stream::try_stream!`) to use
 `?`. On task or delivery failure, temporary progress attempts to delete its status;
-editing progress leaves the last delivered status visible. Cancellation/drop cannot
-guarantee cleanup. Updates are delivered in order, with backpressure; there is no
-coalescing or throttling yet. A temporary final result may be a `File`.
+editing progress leaves the last delivered status visible. A temporary final result
+may be a `File`.
+
+Use `.throttle(Duration::from_secs(1))` on either strategy to send the first update
+immediately and retain only the latest pending update between edits. A pending
+update flushes when its interval ends, even if the producer is still working.
+Finish bypasses the timer and replaces any pending update; it is never coalesced
+away. Semantic progress assertions still see every yielded item. Throttling is
+opt-in; zero disables it. Delivery retains backpressure while a Telegram call is
+in flight. The echo example uses a one-second interval.
+
+The runtime cancels through `Router::handle_until(event, cancel_future,
+cleanup_timeout)`. This drops unfinished handlers, middleware, and response streams,
+then attempts to delete known temporary progress messages within one shared cleanup
+budget. Parallel temporary statuses are all tracked. Editing progress remains
+visible. Directly dropping the dispatch future skips cleanup. A send cancelled
+before its message ID is known cannot be cleaned up reliably; raw calls, imperative
+`Tg` messages, and detached application tasks remain the application's responsibility.
 
 ## State, middleware, and escape hatches
 
@@ -244,8 +286,9 @@ State is one explicit type; compose services with ordinary structs. The router
 implements `tower_service::Service<Event>`. Its custom `Middleware`/`Next` boundary
 keeps layer types erased. Last added layer is outermost. `Trace` creates a span per
 event; `ConcurrencyLimit` covers both handlers and response execution, including
-progress streams. Limits are shared across router clones. `poll_ready` is always
-ready; middleware admission happens in the returned future. The Telegram runtime
+progress streams. Automatic error notices run after middleware and are outside this
+layer's permit; the runtime's task bound still covers them. Limits are shared across
+router clones. `poll_ready` is always ready; middleware admission happens in the returned future. The Telegram runtime
 also bounds spawned handlers per account (64 by default).
 
 ```rust
@@ -282,7 +325,10 @@ Use `.callback(typed_data)`, `.callback_bytes(bytes)`, `.media()`, `.in_chat(id)
 `assert_progress([ProgressEvent::Update(...), ProgressEvent::Finished(...)])` assert
 application semantics. The fixture callback builder panics on invalid encoding;
 `try_callback` exposes the error instead. `TestResult` also exposes dispatch results,
-recorded operations, and semantic progress. `FakeDriver` can test the executor directly.
+recorded operations, and semantic progress. `assert_rejected()` checks the outcome;
+`assert_notice(text)` checks a reply or callback answer even when dispatch rejected
+or failed. `.send_until(cancel_future, cleanup_timeout)` tests cancellation and
+cleanup offline. `FakeDriver` can test the executor directly.
 
 For application crates that need only offline behavior:
 
@@ -317,8 +363,22 @@ must be distinct. Existing bot sessions are checked against the token's account 
 user sessions must already be authorized. An account connection/startup failure stops
 the hive; individual handler errors are logged and intake continues.
 `serve_until(app, shutdown_future)` supports embedding and custom shutdown signals.
-Shutdown waits for handlers to finish, so applications should bound long-running work.
-Dynamic start/stop and interactive user login are future work, not current APIs.
+The default shutdown policy gives handlers 30 seconds to finish, then signals
+cancellation and allows up to 5 seconds for cleanup before aborting remaining tasks.
+Saving update state and closing the sender pool each have the same 5-second timeout.
+Configure these budgets explicitly when needed:
+
+```rust
+.shutdown_policy(ShutdownPolicy {
+    grace_period: std::time::Duration::from_secs(30),
+    cleanup_timeout: std::time::Duration::from_secs(5),
+})
+```
+
+Cleanup is best effort; timeouts cannot preempt synchronous blocking code. Account
+registration remains a startup operation by design. Runtime start/stop controls
+will be added only when an application needs them. Interactive user login remains
+outside this prototype.
 
 ## Workspace and development
 
@@ -331,7 +391,7 @@ Dynamic start/stop and interactive user login are future work, not current APIs.
 | `gramhive` | Facade and prelude; optional `telegram` feature, enabled by default |
 
 Routes, middleware and streams are erased at their boundaries. Core uses Tokio's
-synchronization feature only and has no grammers dependency. No unsafe code, dptree,
+synchronization, timer, and select-macro features and has no grammers dependency. No unsafe code, dptree,
 network mocks, or generalized dependency map are used.
 
 ```sh

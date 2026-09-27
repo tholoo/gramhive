@@ -146,6 +146,22 @@ impl<S: Send + Sync + 'static> EventBuilder<S> {
             progress: self.driver.progress(),
         }
     }
+
+    /// Exercise cancellation and temporary progress cleanup without a live runtime.
+    pub async fn send_until<F>(self, cancel: F, cleanup_timeout: std::time::Duration) -> TestResult
+    where
+        F: std::future::Future<Output = ()> + Send,
+    {
+        let outcome = self
+            .router
+            .handle_until(self.event, cancel, cleanup_timeout)
+            .await;
+        TestResult {
+            outcome,
+            operations: self.driver.operations(),
+            progress: self.driver.progress(),
+        }
+    }
 }
 #[derive(Debug)]
 pub struct TestResult {
@@ -166,8 +182,23 @@ impl TestResult {
             matches!(self.outcome, Ok(Dispatch::Rejected(_))),
             "{self:?}"
         );
-        assert!(self.operations.is_empty());
     }
+
+    /// Assert a user-facing reply or callback notice while retaining the failure/rejection outcome.
+    pub fn assert_notice(&self, text: &str) {
+        assert!(
+            self.operations.iter().any(|op| match op {
+                Operation::Send { body, reply: true } => body.text == text,
+                Operation::Answer {
+                    text: Some(message),
+                    ..
+                } => message == text,
+                _ => false,
+            }),
+            "missing notice {text:?}: {self:?}"
+        );
+    }
+
     pub fn assert_reply(&self, text: &str) {
         self.assert_handled();
         assert!(

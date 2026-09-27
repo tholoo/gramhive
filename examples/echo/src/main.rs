@@ -110,11 +110,11 @@ fn stages() -> impl gramhive::Stream<Item = ProgressItem> {
 }
 
 async fn editing() -> Progress {
-    Progress::editing(stages())
+    Progress::editing(stages()).throttle(std::time::Duration::from_secs(1))
 }
 
 async fn temporary() -> Progress {
-    Progress::temporary(stages())
+    Progress::temporary(stages()).throttle(std::time::Duration::from_secs(1))
 }
 
 async fn manual(Tg(tg): Tg) -> Result<(), Failure> {

@@ -3,6 +3,7 @@ use std::{
     future::Future,
     sync::Arc,
     task::{Context, Poll},
+    time::SystemTime,
 };
 use tracing::Instrument;
 
@@ -46,6 +47,17 @@ pub struct Matcher(Arc<MatchFn>);
 impl Matcher {
     pub fn new(f: impl Fn(&Event) -> Result<bool, Rejection> + Send + Sync + 'static) -> Self {
         Self(Arc::new(f))
+    }
+
+    /// Stop matching at this deployment-stable deadline. Unmatched callbacks use the
+    /// router's expired-button policy. Register old and new schema routes side by side.
+    pub fn until(self, deadline: SystemTime) -> Self {
+        Self::new(move |event| {
+            if SystemTime::now() >= deadline {
+                return Ok(false);
+            }
+            (self.0)(event)
+        })
     }
 }
 pub fn text() -> Matcher {
@@ -92,6 +104,7 @@ pub struct Router<S = ()> {
     routes: Arc<Vec<Route<S>>>,
     state: Arc<S>,
     layers: Vec<Arc<dyn Middleware>>,
+    policy: Arc<dyn ResponsePolicy>,
 }
 impl<S> Clone for Router<S> {
     fn clone(&self) -> Self {
@@ -99,6 +112,7 @@ impl<S> Clone for Router<S> {
             routes: self.routes.clone(),
             state: self.state.clone(),
             layers: self.layers.clone(),
+            policy: self.policy.clone(),
         }
     }
 }
@@ -119,6 +133,7 @@ impl<S: Send + Sync + 'static> Router<S> {
             routes: Arc::new(Vec::new()),
             state: Arc::new(state),
             layers: Vec::new(),
+            policy: Arc::new(DefaultPolicy),
         }
     }
     pub fn route<H, A>(mut self, matcher: Matcher, handler: H) -> Self
@@ -138,6 +153,12 @@ impl<S: Send + Sync + 'static> Router<S> {
         self.layers.push(Arc::new(middleware));
         self
     }
+    /// Replace user-facing rejection, failure, and expired callback responses.
+    pub fn response_policy(mut self, policy: impl ResponsePolicy) -> Self {
+        self.policy = Arc::new(policy);
+        self
+    }
+
     pub fn handle(&self, event: Event) -> BoxFuture<'static, Result<Dispatch, Failure>> {
         let router = self.clone();
         let mut next = Next(Arc::new(move |event: Event| {
@@ -158,6 +179,13 @@ impl<S: Send + Sync + 'static> Router<S> {
                         Err(e) => return Ok(Dispatch::Rejected(e)),
                     }
                 }
+                if matches!(event.kind, EventKind::Callback(_)) {
+                    let response = router.policy.expired_callback(&event);
+                    if !matches!(response, Response::None) {
+                        execute(response, event.driver.clone()).await?;
+                        return Ok(Dispatch::Handled);
+                    }
+                }
                 Ok(Dispatch::NotMatched)
             })
         }));
@@ -165,7 +193,27 @@ impl<S: Send + Sync + 'static> Router<S> {
             let layer = layer.clone();
             next = Next(Arc::new(move |event| layer.handle(event, next.clone())));
         }
-        next.run(event)
+        let policy = self.policy.clone();
+        Box::pin(async move {
+            let outcome = next.run(event.clone()).await;
+            let response = match &outcome {
+                Ok(Dispatch::Rejected(error)) => {
+                    tracing::warn!(%error, account = %event.account.name, "event rejected");
+                    policy.rejected(&event, error)
+                }
+                Err(error) => {
+                    tracing::error!(%error, account = %event.account.name, "handler or response failed");
+                    policy.failed(&event)
+                }
+                _ => Response::None,
+            };
+            // One best-effort notification. A failed notification must not recursively
+            // trigger another response or replace the original application outcome.
+            if let Err(error) = execute(response, event.driver).await {
+                tracing::warn!(%error, "could not deliver error notice");
+            }
+            outcome
+        })
     }
 }
 impl<S> Clone for Route<S> {
@@ -178,6 +226,7 @@ impl<S> Clone for Route<S> {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Dispatch {
+    Cancelled,
     NotMatched,
     Rejected(Rejection),
     Handled,

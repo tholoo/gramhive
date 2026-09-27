@@ -64,18 +64,35 @@ documented so embedding users can choose their own queue/backpressure policy.
 - Progress finishes with `Reply` (including `File` conversion), rather than arbitrary
   response plans: editing a sequence or callback answer into a status is undefined.
 
-## Before expanding scope
+## Adopted application policies
 
-1. Decide the application's rejection/error presentation policy. Routing exposes
-   distinct outcomes; the runtime currently logs them.
-2. Decide progress cancellation and rate/coalescing policy before using it for
-   high-frequency or persistent background jobs. Shutdown currently drains work.
-3. Choose whether raw operations need a mockable application service layer in each
-   app; raw Telegram calls intentionally bypass the fake driver.
-4. Decide callback schema migration expectations. Names survive enum reordering,
-   but changing fields or variant names requires a new prefix.
-5. Dynamic account control, per-chat ordering, richer file/media responses and
-   interactive user authentication should follow actual application requirements.
+- User-facing errors are configurable through `ResponsePolicy`. Defaults show useful
+  public validation text, generic internal failures, and invalid/expired callback
+  notices. Internal Failure details stay in tracing logs. `SilentPolicy` allows
+  applications to own all presentation. Notifications run after user middleware;
+  outcomes remain rejected/failed even if notification succeeds.
+- Shutdown allows a configurable grace period (30 seconds by default), then cancels
+  unfinished dispatches with a bounded cleanup phase (5 seconds). Saving update
+  state and closing the sender pool have separate bounded phases using the same
+  cleanup timeout. Account registration remains static until runtime controls have
+  a concrete application use case.
+- `Router::handle_until` wraps the event driver with a small temporary-message
+  registry. Dropping the inner dispatch future stops work before cleanup begins.
+  The executor registers only temporary progress statuses, forgets successful
+  deletions, and never treats final results or imperative messages as temporary.
+  Cleanup cannot recover message IDs for sends whose replies were not received.
+- `Progress::throttle` coalesces pending updates, flushes by timer, and delivers the
+  first update and final result immediately. It is optional; semantic progress
+  events remain unchanged for tests. Network calls still apply backpressure.
+- Breaking callback schemas get new prefixes. Register old handlers with
+  `.until(absolute_deadline)` during a short transition. The default fallback
+  answers unmatched callbacks with an expired-button notice. Deadlines belong in
+  deployment configuration so restarting does not extend compatibility indefinitely.
+
+Before adding persistent jobs, decide their durability and retry requirements.
+Raw operations can be isolated behind an application service when they need offline
+mocks. Per-chat ordering, richer media and interactive authentication should follow
+concrete application requirements rather than expand this prototype speculatively.
 
 No live Telegram credentials are used by tests. Successful offline checks establish
 routing/execution semantics and API compatibility, not a live-account smoke test.
