@@ -1,0 +1,5 @@
+error: #[rest] supports only String or Option<String>
+ --> tests/ui/rest_type.rs:6:8
+  |
+6 |     a: i64,
+  |        ^^^

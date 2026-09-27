@@ -1,0 +1,13 @@
+[package]
+name = "gramhive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["telegram"]
+telegram = ["dep:gramhive-grammers"]
+[dependencies]
+gramhive-core.workspace = true
+gramhive-macros.workspace = true
+gramhive-grammers = { workspace = true, optional = true }

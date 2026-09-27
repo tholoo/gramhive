@@ -1,0 +1,5 @@
+error: duplicate metadata
+ --> tests/ui/callback_metadata.rs:3:28
+  |
+3 | #[callback(prefix = "bad", prefix = "again")]
+  |                            ^^^^^^

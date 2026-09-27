@@ -1,0 +1,5 @@
+error: duplicate metadata
+ --> tests/ui/duplicate.rs:3:25
+  |
+3 | #[command(name = "bad", name = "again")]
+  |                         ^^^^

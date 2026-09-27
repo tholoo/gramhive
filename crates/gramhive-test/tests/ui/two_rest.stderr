@@ -1,0 +1,6 @@
+error: at most one #[rest] field is allowed
+ --> tests/ui/two_rest.rs:7:5
+  |
+7 | /     #[rest]
+8 | |     b: String,
+  | |_____________^

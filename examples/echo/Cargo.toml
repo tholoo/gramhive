@@ -1,0 +1,15 @@
+[package]
+name = "gramhive-echo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+gramhive = { workspace = true, features = ["telegram"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+async-stream = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+gramhive-test.workspace = true

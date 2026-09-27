@@ -1,0 +1,13 @@
+[package]
+name = "gramhive-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+
+[dependencies]
+futures.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tower-service = "0.3"

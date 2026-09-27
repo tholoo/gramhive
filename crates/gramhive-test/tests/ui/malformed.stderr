@@ -1,0 +1,5 @@
+error: expected string literal
+ --> tests/ui/malformed.rs:3:18
+  |
+3 | #[command(name = 42)]
+  |                  ^^

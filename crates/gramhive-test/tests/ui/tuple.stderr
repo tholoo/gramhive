@@ -1,0 +1,5 @@
+error: use a unit or named-field declaration
+ --> tests/ui/tuple.rs:4:11
+  |
+4 | struct Bad(String);
+  |           ^^^^^^^^

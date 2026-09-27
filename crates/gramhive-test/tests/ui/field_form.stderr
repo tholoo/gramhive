@@ -1,0 +1,5 @@
+error: positional fields require a concrete FromStr type; optional input uses #[rest] Option<String>
+ --> tests/ui/field_form.rs:5:13
+  |
+5 |     values: Vec<String>,
+  |             ^^^^^^^^^^^

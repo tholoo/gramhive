@@ -1,34 +1,19 @@
-[package]
-name = "gramhive"
-version = "0.1.0"
+[workspace]
+resolver = "3"
+members = ["crates/*", "examples/echo"]
+
+[workspace.package]
+version = "0.2.0"
 edition = "2024"
-description = "A high-level library on top of grammers for building Telegram bots."
 license = "MIT"
 
-[lib]
-path = "src/lib.rs"
-
-[dependencies]
-chrono = { version = "0.4.40", features = ["serde"] }
-dptree = "0.3.0"
-futures = "0.3.31"
-grammers-client = { git = "https://github.com/Lonami/grammers.git", features = [
-  "html5ever",
-  "html",
-  "markdown",
-  "parse_invite_link",
-] }
-grammers-mtsender = "0.7.0"
-htmlescape = "0.3.1"
-mockall = { version = "0.13.1", features = ["nightly"] }
-phf = { version = "0.11.3", features = ["macros"] }
-pulldown-cmark = "0.13.0"
-regex = "1.11.1"
-serde = { version = "1.0.219", features = ["derive"] }
-thiserror = "2.0.12"
-tokio = { version = "1.44.1", features = ["full"] }
-tracing = "0.1.41"
-gramhive_macros = { path = "./gramhive_macros" }
-async-trait = "0.1.88"
-bon = "3.6.0"
-dialoguer = "0.11.0"
+[workspace.dependencies]
+gramhive-core = { path = "crates/gramhive-core" }
+gramhive-macros = { path = "crates/gramhive-macros" }
+gramhive-grammers = { path = "crates/gramhive-grammers" }
+gramhive-test = { path = "crates/gramhive-test" }
+gramhive = { path = "crates/gramhive", default-features = false }
+futures = { version = "0.3.31", default-features = false, features = ["std", "async-await"] }
+tokio = { version = "1", features = ["sync"] }
+thiserror = "2"
+tracing = "0.1"

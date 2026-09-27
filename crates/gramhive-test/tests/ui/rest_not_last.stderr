@@ -1,0 +1,6 @@
+error: #[rest] must be the final field
+ --> tests/ui/rest_not_last.rs:5:5
+  |
+5 | /     #[rest]
+6 | |     a: String,
+  | |_____________^

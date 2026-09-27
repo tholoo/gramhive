@@ -1,0 +1,5 @@
+error: unknown metadata key
+ --> tests/ui/unknown_metadata.rs:3:25
+  |
+3 | #[command(name = "bad", magic = "yes")]
+  |                         ^^^^^

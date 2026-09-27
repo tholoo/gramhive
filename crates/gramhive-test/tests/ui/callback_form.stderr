@@ -1,0 +1,5 @@
+error: use a unit or named-field declaration
+ --> tests/ui/callback_form.rs:5:10
+  |
+5 |     Tuple(String),
+  |          ^^^^^^^^
